@@ -1,11 +1,19 @@
 // ═══════════════════════════════════════════
-// In-memory storage for scope contracts and action logs
+// Storage layer for scope contracts and action logs
+// Backed by SQLite via src/db.js
+// In-memory action log retained (rolling 100-entry window per agent)
 // ═══════════════════════════════════════════
 
-/** @type {Map<string, object>} agent_id -> scope contract */
-const contracts = new Map();
+import {
+  dbUpsertScope,
+  dbGetScope,
+  dbGetAllScopes,
+  dbInsertViolation,
+  dbGetViolationsByAgent,
+  dbCountViolations,
+} from './db.js';
 
-/** @type {Map<string, object[]>} agent_id -> action log entries */
+/** @type {Map<string, object[]>} agent_id -> action log entries (in-memory, rolling) */
 const actionLogs = new Map();
 
 // ═══════════════════════════════════════════
@@ -13,27 +21,36 @@ const actionLogs = new Map();
 // ═══════════════════════════════════════════
 
 export function createContract(agentId, opts) {
-  const contract = {
-    contract_id: `sc_${Date.now()}_${agentId}`,
-    agent_id: agentId,
-    allowed_tools: opts.allowed_tools || [],
-    forbidden_tools: opts.forbidden_tools || [],
-    allowed_files: opts.allowed_files || [],
-    max_delegations: opts.max_delegations ?? 3,
-    description: opts.description || '',
-    created_at: new Date().toISOString(),
-    delegation_count: 0,
+  const contractId = `sc_${Date.now()}_${agentId}`;
+  const createdAt  = new Date().toISOString();
+
+  const restrictions = {
+    forbidden_tools:   opts.forbidden_tools   || [],
+    max_delegations:   opts.max_delegations   ?? 3,
+    description:       opts.description       || '',
+    delegation_count:  0,
   };
-  contracts.set(agentId, contract);
-  return contract;
+
+  dbUpsertScope(
+    contractId,
+    agentId,
+    opts.allowed_files || [],
+    opts.allowed_tools || [],
+    restrictions,
+    createdAt,
+  );
+
+  return _buildContract(contractId, agentId, opts.allowed_files || [], opts.allowed_tools || [], restrictions, createdAt);
 }
 
 export function getContract(agentId) {
-  return contracts.get(agentId) || null;
+  const row = dbGetScope(agentId);
+  if (!row) return null;
+  return _rowToContract(row);
 }
 
 export function listContracts() {
-  return Array.from(contracts.values());
+  return dbGetAllScopes().map(_rowToContract);
 }
 
 // ═══════════════════════════════════════════
@@ -42,9 +59,11 @@ export function listContracts() {
 
 /**
  * Check if an action is allowed by the agent's scope contract.
+ * Identical signature to the original.
  */
 export function validateAction(agentId, toolName, filePath) {
-  const contract = contracts.get(agentId);
+  const contract = getContract(agentId);
+
   if (!contract) {
     return {
       allowed: false,
@@ -55,43 +74,30 @@ export function validateAction(agentId, toolName, filePath) {
 
   // Check forbidden tools first (takes priority)
   if (contract.forbidden_tools.length > 0 && contract.forbidden_tools.includes(toolName)) {
-    return {
-      allowed: false,
-      reason: `Tool "${toolName}" is explicitly forbidden for agent "${agentId}".`,
-      contract_id: contract.contract_id,
-    };
+    const detail = `Tool "${toolName}" is explicitly forbidden for agent "${agentId}".`;
+    dbInsertViolation(contract.contract_id, agentId, 'forbidden_tool', detail);
+    return { allowed: false, reason: detail, contract_id: contract.contract_id };
   }
 
   // Check allowed tools (if list is non-empty, tool must be in it)
   if (contract.allowed_tools.length > 0 && !contract.allowed_tools.includes(toolName)) {
-    return {
-      allowed: false,
-      reason: `Tool "${toolName}" is not in the allowed tools list for agent "${agentId}". Allowed: [${contract.allowed_tools.join(', ')}].`,
-      contract_id: contract.contract_id,
-    };
+    const detail = `Tool "${toolName}" is not in the allowed tools list for agent "${agentId}". Allowed: [${contract.allowed_tools.join(', ')}].`;
+    dbInsertViolation(contract.contract_id, agentId, 'disallowed_tool', detail);
+    return { allowed: false, reason: detail, contract_id: contract.contract_id };
   }
 
   // Check file path restrictions
   if (filePath && contract.allowed_files.length > 0) {
     const fileAllowed = contract.allowed_files.some((pattern) => {
-      // Support glob-like prefix matching: "src/lib/*" matches "src/lib/foo.js"
-      if (pattern.endsWith('*')) {
-        return filePath.startsWith(pattern.slice(0, -1));
-      }
-      // Support directory matching: "src/lib/" matches "src/lib/foo.js"
-      if (pattern.endsWith('/')) {
-        return filePath.startsWith(pattern);
-      }
-      // Exact match
+      if (pattern.endsWith('*'))  return filePath.startsWith(pattern.slice(0, -1));
+      if (pattern.endsWith('/'))  return filePath.startsWith(pattern);
       return filePath === pattern;
     });
 
     if (!fileAllowed) {
-      return {
-        allowed: false,
-        reason: `File "${filePath}" is outside the allowed file scope for agent "${agentId}". Allowed patterns: [${contract.allowed_files.join(', ')}].`,
-        contract_id: contract.contract_id,
-      };
+      const detail = `File "${filePath}" is outside the allowed file scope for agent "${agentId}". Allowed patterns: [${contract.allowed_files.join(', ')}].`;
+      dbInsertViolation(contract.contract_id, agentId, 'disallowed_file', detail);
+      return { allowed: false, reason: detail, contract_id: contract.contract_id };
     }
   }
 
@@ -119,7 +125,7 @@ export function detectDelegationLoop(chain) {
 
   for (let i = 0; i < chain.length; i++) {
     const from = chain[i].from;
-    const to = chain[i].to;
+    const to   = chain[i].to;
 
     if (!visited.has(from)) {
       visited.set(from, i);
@@ -127,7 +133,7 @@ export function detectDelegationLoop(chain) {
 
     if (visited.has(to)) {
       // Found a cycle — extract it
-      const cycleStart = visited.get(to);
+      const cycleStart  = visited.get(to);
       const cycleAgents = [];
       for (let j = cycleStart; j <= i; j++) {
         cycleAgents.push(chain[j].from);
@@ -145,19 +151,19 @@ export function detectDelegationLoop(chain) {
   // Check delegation limits
   const delegationCounts = new Map();
   for (const link of chain) {
-    const count = (delegationCounts.get(link.from) || 0) + 1;
+    const count    = (delegationCounts.get(link.from) || 0) + 1;
     delegationCounts.set(link.from, count);
 
-    const contract = contracts.get(link.from);
+    const contract = getContract(link.from);
     if (contract && count > contract.max_delegations) {
       return {
         is_loop: false,
         cycle: [],
         suggestion: `Agent "${link.from}" has exceeded its max delegation limit (${contract.max_delegations}). Current count: ${count}. The agent should execute the task directly.`,
         delegation_limit_exceeded: true,
-        agent_id: link.from,
+        agent_id:      link.from,
         current_count: count,
-        max_allowed: contract.max_delegations,
+        max_allowed:   contract.max_delegations,
       };
     }
   }
@@ -180,12 +186,12 @@ export function logAction(agentId, actionType, details) {
     actionLogs.set(agentId, []);
   }
 
-  const log = actionLogs.get(agentId);
+  const log   = actionLogs.get(agentId);
   const entry = {
-    agent_id: agentId,
+    agent_id:    agentId,
     action_type: actionType,
-    details: details || {},
-    timestamp: new Date().toISOString(),
+    details:     details || {},
+    timestamp:   new Date().toISOString(),
   };
 
   log.push(entry);
@@ -195,20 +201,21 @@ export function logAction(agentId, actionType, details) {
     log.splice(0, log.length - MAX_LOG_ENTRIES);
   }
 
-  // Track delegations against contract
+  // Track delegations against contract in DB
   if (actionType === 'delegation') {
-    const contract = contracts.get(agentId);
-    if (contract) {
-      contract.delegation_count += 1;
+    const row = dbGetScope(agentId);
+    if (row) {
+      const restrictions = { ...row.restrictions, delegation_count: (row.restrictions.delegation_count || 0) + 1 };
+      dbUpsertScope(row.scope_id, agentId, row.allowed_files, row.allowed_tools, restrictions, row.created_at);
     }
   }
 
   return {
-    logged: true,
-    agent_id: agentId,
-    action_type: actionType,
+    logged:        true,
+    agent_id:      agentId,
+    action_type:   actionType,
     total_actions: log.length,
-    timestamp: entry.timestamp,
+    timestamp:     entry.timestamp,
   };
 }
 
@@ -217,17 +224,21 @@ export function logAction(agentId, actionType, details) {
 // ═══════════════════════════════════════════
 
 export function getComplianceReport() {
-  const allAgentIds = new Set([...contracts.keys(), ...actionLogs.keys()]);
+  const allContracts = listContracts();
+  const allAgentIds  = new Set([
+    ...allContracts.map((c) => c.agent_id),
+    ...actionLogs.keys(),
+  ]);
+
   const agents = [];
 
   for (const agentId of allAgentIds) {
-    const contract = contracts.get(agentId);
-    const logs = actionLogs.get(agentId) || [];
+    const contract = getContract(agentId);
+    const logs     = actionLogs.get(agentId) || [];
 
-    // Count violations by replaying actions against contract
-    let violations = 0;
-    let delegationCount = 0;
-    const toolsUsed = new Set();
+    let violations       = dbCountViolations(agentId);
+    let delegationCount  = 0;
+    const toolsUsed      = new Set();
 
     for (const entry of logs) {
       if (entry.action_type === 'delegation') {
@@ -235,21 +246,6 @@ export function getComplianceReport() {
       }
       if (entry.action_type === 'tool_call' && entry.details.tool_name) {
         toolsUsed.add(entry.details.tool_name);
-        if (contract) {
-          const result = validateAction(agentId, entry.details.tool_name, entry.details.file_path);
-          if (!result.allowed) violations++;
-        }
-      }
-      if (entry.action_type === 'file_access' && entry.details.file_path && contract) {
-        // Check file access against allowed files
-        if (contract.allowed_files.length > 0) {
-          const fileAllowed = contract.allowed_files.some((p) => {
-            if (p.endsWith('*')) return entry.details.file_path.startsWith(p.slice(0, -1));
-            if (p.endsWith('/')) return entry.details.file_path.startsWith(p);
-            return entry.details.file_path === p;
-          });
-          if (!fileAllowed) violations++;
-        }
       }
     }
 
@@ -257,26 +253,26 @@ export function getComplianceReport() {
     let scopeUtilization = 0;
     if (contract && contract.allowed_tools.length > 0) {
       const usedAllowed = contract.allowed_tools.filter((t) => toolsUsed.has(t));
-      scopeUtilization = Math.round((usedAllowed.length / contract.allowed_tools.length) * 100);
+      scopeUtilization  = Math.round((usedAllowed.length / contract.allowed_tools.length) * 100);
     }
 
     agents.push({
-      agent_id: agentId,
-      has_contract: !!contract,
-      total_actions: logs.length,
+      agent_id:                 agentId,
+      has_contract:             !!contract,
+      total_actions:            logs.length,
       violations,
-      delegation_count: delegationCount,
-      max_delegations: contract ? contract.max_delegations : null,
+      delegation_count:         delegationCount,
+      max_delegations:          contract ? contract.max_delegations : null,
       scope_utilization_percent: scopeUtilization,
-      tools_used: Array.from(toolsUsed),
+      tools_used:               Array.from(toolsUsed),
     });
   }
 
   return {
-    total_agents: agents.length,
+    total_agents:     agents.length,
     total_violations: agents.reduce((s, a) => s + a.violations, 0),
     agents,
-    generated_at: new Date().toISOString(),
+    generated_at:     new Date().toISOString(),
   };
 }
 
@@ -286,10 +282,9 @@ export function getComplianceReport() {
 
 /**
  * Compare action logs across agents to find duplicated work.
- * Two agents calling the same tool with similar arguments = potential duplication.
  */
 export function detectWorkDuplication() {
-  const agentIds = Array.from(actionLogs.keys());
+  const agentIds  = Array.from(actionLogs.keys());
   const duplicates = [];
 
   for (let i = 0; i < agentIds.length; i++) {
@@ -297,7 +292,6 @@ export function detectWorkDuplication() {
       const logsA = actionLogs.get(agentIds[i]);
       const logsB = actionLogs.get(agentIds[j]);
 
-      // Compare tool_call actions
       const toolCallsA = logsA.filter((e) => e.action_type === 'tool_call');
       const toolCallsB = logsB.filter((e) => e.action_type === 'tool_call');
 
@@ -306,16 +300,15 @@ export function detectWorkDuplication() {
           if (!a.details.tool_name || !b.details.tool_name) continue;
           if (a.details.tool_name !== b.details.tool_name) continue;
 
-          // Same tool — check argument similarity
           const similarity = computeArgSimilarity(a.details.args, b.details.args);
           if (similarity >= 0.7) {
             duplicates.push({
-              agent_a: agentIds[i],
-              agent_b: agentIds[j],
-              action: a.details.tool_name,
+              agent_a:    agentIds[i],
+              agent_b:    agentIds[j],
+              action:     a.details.tool_name,
               similarity: Math.round(similarity * 100),
-              args_a: a.details.args,
-              args_b: b.details.args,
+              args_a:     a.details.args,
+              args_b:     b.details.args,
               timestamps: { a: a.timestamp, b: b.timestamp },
             });
           }
@@ -325,7 +318,7 @@ export function detectWorkDuplication() {
   }
 
   // Deduplicate: keep only the highest similarity per agent pair + tool
-  const seen = new Set();
+  const seen   = new Set();
   const unique = [];
   for (const d of duplicates) {
     const key = `${d.agent_a}|${d.agent_b}|${d.action}`;
@@ -337,8 +330,8 @@ export function detectWorkDuplication() {
 
   return {
     duplicates_found: unique.length > 0,
-    duplicate_count: unique.length,
-    duplicate_pairs: unique,
+    duplicate_count:  unique.length,
+    duplicate_pairs:  unique,
     suggestion: unique.length > 0
       ? `Found ${unique.length} potential work duplication(s). Consider assigning non-overlapping scopes or consolidating tasks.`
       : 'No work duplication detected across agents.',
@@ -346,22 +339,18 @@ export function detectWorkDuplication() {
   };
 }
 
-/**
- * Compute similarity between two argument objects.
- * Returns 0..1 where 1 = identical.
- */
+// ─── Internal helpers ─────────────────────────
+
 function computeArgSimilarity(argsA, argsB) {
   if (!argsA && !argsB) return 1;
   if (!argsA || !argsB) return 0;
 
   const strA = JSON.stringify(argsA);
   const strB = JSON.stringify(argsB);
-
   if (strA === strB) return 1;
 
-  // Key overlap approach
-  const keysA = Object.keys(argsA);
-  const keysB = Object.keys(argsB);
+  const keysA   = Object.keys(argsA);
+  const keysB   = Object.keys(argsB);
   const allKeys = new Set([...keysA, ...keysB]);
 
   if (allKeys.size === 0) return 1;
@@ -373,18 +362,40 @@ function computeArgSimilarity(argsA, argsB) {
       const valB = JSON.stringify(argsB[key]);
       if (valA === valB) {
         matchingValues++;
-      } else {
-        // Partial credit for string similarity
-        if (typeof argsA[key] === 'string' && typeof argsB[key] === 'string') {
-          const shorter = Math.min(argsA[key].length, argsB[key].length);
-          const longer = Math.max(argsA[key].length, argsB[key].length);
-          if (longer > 0 && argsA[key].includes(argsB[key]) || argsB[key].includes(argsA[key])) {
-            matchingValues += shorter / longer;
-          }
+      } else if (typeof argsA[key] === 'string' && typeof argsB[key] === 'string') {
+        const shorter = Math.min(argsA[key].length, argsB[key].length);
+        const longer  = Math.max(argsA[key].length, argsB[key].length);
+        if (longer > 0 && (argsA[key].includes(argsB[key]) || argsB[key].includes(argsA[key]))) {
+          matchingValues += shorter / longer;
         }
       }
     }
   }
 
   return matchingValues / allKeys.size;
+}
+
+function _buildContract(contractId, agentId, allowedFiles, allowedTools, restrictions, createdAt) {
+  return {
+    contract_id:      contractId,
+    agent_id:         agentId,
+    allowed_tools:    allowedTools,
+    forbidden_tools:  restrictions.forbidden_tools  || [],
+    allowed_files:    allowedFiles,
+    max_delegations:  restrictions.max_delegations  ?? 3,
+    description:      restrictions.description      || '',
+    created_at:       createdAt,
+    delegation_count: restrictions.delegation_count || 0,
+  };
+}
+
+function _rowToContract(row) {
+  return _buildContract(
+    row.scope_id,
+    row.agent_id,
+    row.allowed_files,
+    row.allowed_tools,
+    row.restrictions,
+    row.created_at,
+  );
 }
