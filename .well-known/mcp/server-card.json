@@ -1,0 +1,43 @@
+{
+  "serverInfo": {
+    "name": "scope-guard-mcp",
+    "version": "0.1.0",
+    "description": "Enforces multi-agent scope boundaries — prevents scope drift, work duplication, and infinite delegation loops in agentic systems",
+    "author": "THRONE AI",
+    "license": "MIT",
+    "homepage": "https://github.com/mdfifty50-boop/scope-guard-mcp",
+    "repository": "https://github.com/mdfifty50-boop/scope-guard-mcp"
+  },
+  "capabilities": {
+    "tools": [
+      { "name": "create_scope_contract", "description": "Define agent boundaries: allowed/forbidden tools, file access patterns, delegation limits" },
+      { "name": "validate_action", "description": "Pre-flight check — is this tool call or file access within the agent's scope contract?" },
+      { "name": "detect_delegation_loop", "description": "Analyze a delegation chain for circular patterns that cause infinite loops" },
+      { "name": "log_agent_action", "description": "Track agent actions (tool calls, delegations, file access, completions) for compliance" },
+      { "name": "get_compliance_report", "description": "Per-agent summary: total actions, violations, delegation count, scope utilization %" },
+      { "name": "detect_work_duplication", "description": "Find agents doing the same work by comparing action logs across all agents" }
+    ],
+    "resources": [
+      { "uri": "scope-guard://contracts", "description": "List all active scope contracts with summary stats" }
+    ]
+  },
+  "categories": ["governance", "reliability", "developer-tools", "agentic-engineering"],
+  "keywords": ["scope-guard", "scope-enforcement", "multi-agent", "delegation-loop", "work-duplication", "ai-agent", "governance"],
+  "pricing": {
+    "free_tier": true,
+    "free_limit": "Unlimited agents, in-memory only",
+    "pro": "$99/month — persistent storage, policy templates, Slack/Discord alerts",
+    "enterprise": "$499/month — SSO, audit logs, custom policy engine, multi-tenant"
+  },
+  "install": {
+    "npm": "npx scope-guard-mcp",
+    "claude_desktop": {
+      "mcpServers": {
+        "scope-guard": {
+          "command": "npx",
+          "args": ["scope-guard-mcp"]
+        }
+      }
+    }
+  }
+}
